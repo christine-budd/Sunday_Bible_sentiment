@@ -1,0 +1,681 @@
+---
+title: "Unstructured Final Project: Scraping the Bible and Anlyzing Emotional Tones of Sunday Mass Readings"
+author: Christine Budd
+format: gfm
+execute: 
+  warning: false
+  message: false
+  errors: false
+jupyter: python3
+---
+
+## Project Overview
+
+The intention of this project is to collect all readings from a Catholic Sunday Mass to see if it is possible to identify any connections between their sentiment over time. In order to do this, we need to find the schedule of all readings, which I found at https://catholic-resources.org/Lectionary/Index-Sundays.htm. This resource did not include the Bible passages themselves, only the Bible citation, so I need to have a list of all Bible verses to pull from that could be correctly matched to the correct date. 
+
+I found it easiest to scrape the entire Bible from https://www.biblegateway.com/passage/, with help from https://www.usccb.org/offices/new-american-bible/books-bible, which gave me an accurate list of all books considered canon by the Catholic Church. By using regex to match the format of the notation used for the Bible citations to the corresponding columns of my scraped Bible dataframe, I was able to obtain the full passages read out loud for Reading 1, Reading 2, and the Gospel on Sundays (and Holy Days). 
+
+I concluded this project by preforming some sentiment analysis on the full passage, getting a score for the negative, neutral, positive, and compound sentiment. I founda few interesting trends to notice in the sentiment analysis, but overall I did not find any significant patterns. FOr example, I did observe high positive sentiment during the Christmas and Easter period regardless of year (although granted, all years use the same readings during Christmas so this is only actually insightful for Easter), and the range of compound sentiment for Reading 1 drops a lot lower than it does for Reading 2 or the Gospel, even though the average sentiment remained high.
+
+## Obtaining table of all Bible verses
+
+First we make a dictionary of all the books of Bible, and number of verses in each book:
+
+```{python}
+import requests
+import pandas as pd
+import re
+from bs4 import BeautifulSoup
+
+url = "https://www.usccb.org/offices/new-american-bible/books-bible"
+
+bookresponse = requests.get(url)
+booksoup = BeautifulSoup(bookresponse.text, "html.parser")
+
+books = []
+for i in booksoup.select("span.bookname"):
+    name_tag = i.find("strong")
+    if not name_tag:
+        continue
+    bookname = name_tag.get_text(strip=True)
+
+    chaptercount = 0
+    for j in i.next_siblings:
+        if j.name == "span" and "bookname" in j.get("class", []):
+            break
+        if getattr(j, "name", None) == "a":
+            style  = j.get("style", "")
+            if "display:inline-block" in style:
+                chaptercount += 1
+    books.append((bookname, chaptercount))
+
+books = [(bookname, chaptercount) for bookname, chaptercount in books if chaptercount > 0]
+
+bookdict = dict(books)
+bookdict
+```
+
+Create function that given a book of the Bible, can scrape the entire chapter.
+
+```{python}
+def NABREscrape(book):
+    rows = []
+    
+    chapters = bookdict[book]
+    for i in range(chapters):
+        bookname = book
+        chapter = i+1
+
+        url = f"https://www.biblegateway.com/passage/?search={bookname}%20{chapter}&version=NABRE"
+
+        chapterrequest = requests.get(url)
+        chaptersoup = BeautifulSoup(chapterrequest.content, "html.parser")
+        chaptertext = chaptersoup.find("div", class_="version-NABRE")
+
+        for j in chaptertext.find_all(["h2", "h3"], class_=["outline", "chapter"]):
+            j.decompose()
+
+        chaptertext = chaptertext.get_text(separator=" ", strip=True)
+        chapterentry = f"{book} {i + 1}"
+
+        rows.append({"Chapter": chapterentry, "Text": chaptertext})
+
+    df = pd.DataFrame(rows)
+
+    return df
+```
+
+We run the function for all books, and combine into a single dataframe.
+
+```{python}
+#| eval: false
+allrowsdf = []
+
+for i in bookdict.keys():
+    df = NABREscrape(i)
+    allrowsdf.append(df)
+
+allbooks = pd.concat(allrowsdf, ignore_index=True)
+```
+
+We clean the dataframe, starting by removing anything that is not a bible verse.
+
+```{python}
+#| eval: false
+#| results: 'markdown'
+def verseextract(text):
+    if "RCU17TS" in text:
+        text = text.split("RCU17TS")[-1]
+
+    first_verse_pos = text.find("1 ")
+    if first_verse_pos != -1:
+        text = text[first_verse_pos:]
+
+    text = re.sub(r'Footnotes.*', '', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\(.*?\)', '', text) #nongreedy parenthesis
+
+    text = re.sub(r'\[.*?\]', '', text) #nongreedy brackets
+
+    text = re.sub(r'\s+', ' ', text)
+
+    text = text.strip()
+
+    return text
+
+allbooks["Text"] = allbooks["Text"].apply(verseextract)
+allbooks.to_markdown()
+```
+
+Now we are separating each chapter so that verses are on unique rows. This will be a new dataframe, called Bible
+
+```{python}
+#| eval: false
+#| results: 'markdown'
+def split_verses(row):
+    tokens = row['Chapter'].split()
+    chapter = tokens[-1]
+    book = ' '.join(tokens[:-1])
+
+    pattern = r'(\d+)\s(.*?)(?=\s\d+\s|$)' #number upto next number, nongreedy)
+    matches = re.findall(pattern, row['Text'])
+
+    verselist = []
+    for i, j in matches:
+        verselist.append({
+            "book": book,
+            "chapter": chapter,
+            "verse": int(i),
+            "text": j.strip()
+        })
+    return verselist
+
+
+allverses = []
+for _, row in allbooks.iterrows():
+    allverses.extend(split_verses(row))
+
+Bible = pd.DataFrame(allverses)
+
+Bible["book"] = Bible["book"].str.strip().str.lower()
+Bible["chapter"] = Bible["chapter"].astype(int)
+Bible["verse"] = Bible["verse"].astype(int)
+
+Bible.head().to_markdown()
+```
+
+```{python}
+#| results: 'markdown'
+Bible = pd.read_csv("Bible.csv")
+Bible.head(10).to_markdown()
+```
+
+## Obtaining reading schedule for each year
+
+We scrape html to get lectionary information. The first table is established in the html but the second and third are stuck together, so we manually separate them. Then, we convert all three tables to dataframes.
+
+```{python}
+url = "https://catholic-resources.org/Lectionary/Index-Sundays.htm"
+
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0 Safari/537/36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Acccept": "text/html,application/xhtml+xml",
+    "Referer": "https://www.google.com/"
+}
+
+lectresponse = requests.get(url, headers= headers)
+lectsoup = BeautifulSoup(lectresponse.text, "html.parser")
+
+lecttables = lectsoup.find_all("table")
+
+table1 = lecttables[0]
+table2 = lecttables[1]
+
+rows = table2.find_all("tr")
+
+split_index=None
+for i, row in enumerate(rows):
+    text = row.get_text(strip=True)
+    if "new testament reading" in text.lower():
+        split_index = i
+        break
+
+table2soup = BeautifulSoup("<table></table><table></table>", "html.parser")
+table2tables = table2soup.find_all("table")
+
+table2 = table2tables[0]
+table3 = table2tables[1]
+
+for i in rows[:split_index]:
+    table2.append(i)
+
+for i in rows[split_index:]:
+    table3.append(i)
+
+def dfmaker(table):
+    rows = []
+    for i in table.find_all("tr"):
+        cells = i.find_all("td")
+        row = [c.get_text(strip=True) for c in cells]
+        if row:
+            rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    df.columns = df.iloc[0]
+    df = df[1:].reset_index(drop=True)
+
+    df["Lect"] = df["Lect # - Year"].str.extract(r"(\d+)").astype(int)
+    df["Year"] = df["Lect # - Year"].str.extract(r"\d+-(.*)")
+
+    return df
+
+Reading1 = dfmaker(table1)
+Reading2 = dfmaker(table3)
+Gospel = dfmaker(table2)
+```
+
+Cleaning Reading1
+
+```{python}
+#| results: 'markdown'
+Reading1["Date"] = Reading1["Sunday, Solemnity, or Feast"]
+Reading1["Passage"] = Reading1["Old Testament Reading"]
+Reading1 = Reading1[["Date", "Lect", "Year", "Passage"]]
+Reading1 = Reading1.drop_duplicates(subset=["Lect"], keep="first")
+Reading1 = Reading1.dropna(subset=["Year"])
+
+def splitabc(df):
+    abcrows = df[df["Year"] == "ABC"]
+    newdf = df[df["Year"] != "ABC"]
+
+    rows = []
+    for i in ["A","B","C"]:
+        temp = abcrows.copy()
+        temp["Year"] = i
+        rows.append(temp)
+
+    result = pd.concat([newdf] + rows, ignore_index=True)
+
+    return result
+
+Reading1 = splitabc(Reading1)
+Reading1["Reading"] = "Reading1"
+Reading1 = Reading1.sort_values(["Lect", "Year"]).reset_index(drop=True)
+Reading1.to_markdown()
+```
+
+Cleaning Reading2
+
+```{python}
+#| results: 'markdown'
+import numpy as np
+
+Reading2["Date"] = Reading2["Sunday or Feast"]
+Reading2["Passage"] = Reading2["New Testament Reading"]
+Reading2 = Reading2[["Date", "Lect", "Year", "Passage"]]
+Reading2 = Reading2.drop_duplicates(subset=["Lect"], keep="first")
+Reading2 = Reading2.dropna(subset=["Year"])
+
+Reading2 = splitabc(Reading2)
+mask = Reading2["Date"].str.contains("Easter") & Reading2["Passage"].str.contains("Acts")
+Reading2["Reading"] = np.where(mask, "Reading1", "Reading2")
+Reading2 = Reading2.sort_values(["Lect", "Year"]).reset_index(drop=True)
+Reading2.to_markdown()
+```
+
+Cleaning Gospel
+```{python}
+#| results: 'markdown'
+Gospel["Date"] = Gospel["Sunday or Feast"]
+Gospel["Passage"] = Gospel["Gospel Reading"]
+Gospel = Gospel[["Date", "Lect", "Year", "Passage"]]
+Gospel = Gospel.drop_duplicates(subset=["Lect"], keep="first")
+Gospel = Gospel.dropna(subset=["Year"])
+
+Gospel = splitabc(Gospel)
+Gospel["Reading"] = "Gospel"
+Gospel = Gospel.sort_values(["Lect", "Year"]).reset_index(drop=True)
+Gospel.to_markdown()
+```
+
+We combine the three smaller dataframes to create a complete working lectionary (with both readings and the Gospel).
+
+```{python}
+#| results: 'markdown'
+Lectionary = pd.concat([Gospel, Reading1, Reading2], axis=0)
+Lectionary.to_markdown()
+```
+
+Final Cleaning of Lectionary DataFrame
+
+```{python}
+#| results: 'markdown'
+#fixing missed joined readings in Year
+rows = []
+for idx, row in Lectionary.iterrows():
+    stryear = str(row["Year"])
+    pairs = re.findall(r'(\d+)-([ABC])', stryear)
+
+    if pairs:
+        lect1, year1 = pairs[0]
+        Lectionary.at[idx, "Lect"] = int(lect1)
+        Lectionary.at[idx, "Year"] = year1
+
+        for lect, year in pairs[1:]: #new pairs
+            row["Lect"] = int(lect)
+            row["Year"] = year
+            rows.append(row)
+
+Lectionary = pd.concat([Lectionary, pd.DataFrame(rows)], ignore_index=True)
+
+Lectionary["Date"] = Lectionary["Date"].str.replace(r"\(.*?\)", "", regex=True).str.strip()
+
+Lectionary["Passage"] = (Lectionary["Passage"].str.split(r'\bor\b').str[0].str.strip())
+
+Lectionary.head().to_markdown()
+```
+
+## Merging the dataframes
+
+In the lectionary dataframe, the names of the books are abbreivated so we will need to create a dictionary to map them correctly to the Bible dataframe. Rather than map out every single book, we find which abbreviations were even used in Lectionary in the first place.
+
+```{python}
+abbrevs = (Lectionary["Passage"].str.extract(r"^\s*([A-Za-z1-3]+\s?[A-Za-z]+)").dropna()[0].unique())
+
+abbrevs
+```
+
+We create a dictionary for the abbreviations in the previous code (not all books of Bible, only those that appear in abbrevs).
+
+```{python}
+book_map = {
+    "Gen": "Genesis","Exod": "Exodus","Lev": "Leviticus","Num": "Numbers","Deut": "Deuteronomy","Josh": "Joshua","1 Sam": "1 Samuel","2 Sam": "2 Samuel","1 Kgs": "1 Kings","2 Kgs": "2 Kings","2 Chr": "2 Chronicles","Neh": "Nehemiah","Job": "Job","Prov": "Proverbs","Eccl": "Ecclesiastes","Isa": "Isaiah","Jer": "Jeremiah","Ezek": "Ezekiel","Dan": "Daniel","Hos": "Hosea","Amos": "Amos","Jon": "Jonah","Mic": "Micah","Hab": "Habakkuk","Zeph": "Zephaniah","Zech": "Zechariah","Mal": "Malachi","Bar": "Baruch","Sir": "Sirach","Wis": "Wisdom","2 Macc": "2 Maccabees","Matt": "Matthew","Mark": "Mark","Luke": "Luke","John": "John","Acts": "Acts","Rom": "Romans","1 Cor": "1 Corinthians","2 Cor": "2 Corinthians","Gal": "Galatians","Eph": "Ephesians","Phil": "Philippians","Col": "Colossians","1 Thess": "1 Thessalonians","2 Thess": "2 Thessalonians","1 Tim": "1 Timothy","2 Tim": "2 Timothy","Titus": "Titus","Phlm": "Philemon","Heb": "Hebrews","Jas": "James","1 Pet": "1 Peter","2 Pet": "2 Peter","1 John": "1 John","Rev": "Revelation"
+}
+```
+
+Make a function that given a Bible citation, creates a list of tuples, each tuple corresponding to a different verse.
+
+```{python}
+def parse(passage_str):
+    try:
+        result = []
+
+        match = re.match(r'^([1-3]?\s?[A-Za-z]+)\s+(.+)$', passage_str)
+        if not match:
+            return []
+
+        book_abbrev = match.group(1)
+        book = book_map.get(book_abbrev, book_abbrev)
+        refs = match.group(2)
+
+        refs = refs.replace('—', '--').replace('–', '--')
+        parts = re.split(r'[;,]', refs)
+        parts = [p.strip() for p in parts if p.strip()]
+
+        for part in parts:
+            if "--" in part:#two chapters
+                try:
+                    startref, endref = part.split('--')
+                    startchap, startverse = startref.split(':', 1)
+                    endchap, endverse = endref.split(':', 1)
+
+                    startchap = int(re.sub(r'[^\d]', '', startchap))
+                    endchap = int(re.sub(r'[^\d]', '', endchap))
+                    startverse = int(re.sub(r'[^\d]', '', startverse))
+                    endverse = int(re.sub(r'[^\d]', '', endverse))
+
+                    for chapter in range(startchap, endchap + 1):
+                        if chapter == startchap and chapter == endchap:
+                            verses = range(startverse, endverse + 1)
+                        elif chapter == startchap:
+                            verses = range(startverse, 67) #no psalms
+                        elif chapter == endchap:
+                            verses = range(1, endverse + 1)
+                        else:
+                            verses = range(1, 67)
+                        for v in verses:
+                            result.append((book, chap, v))
+                except Exception:
+                    return []
+            else: #single chapters
+                try:
+                    matches = list(re.finditer(r'(\d+)\s*:', part))
+                    if not matches:
+                        return []
+                    m = matches[-1]
+                    chapter = int(m.group(1))
+                    verses_str = part[m.end():].strip()
+
+                    verse_ranges = [v.strip() for v in verses_str.split(',')]
+                    for vr in verse_ranges:
+                        if "-" in vr:
+                            startverse, endverse = vr.split('-', 1)
+                            startverse = int(re.sub(r'[^\d]', '', startverse))
+                            endverse = int(re.sub(r'[^\d]', '', endverse))
+                        else:
+                            startverse = int(re.sub(r'[^\d]', '', vr))
+                            endverse = startverse
+                        for v in range(startverse, endverse + 1):
+                            result.append((book, chapter, v))
+                except Exception:
+                    return []
+
+        return result
+
+    except Exception:
+        return []
+```
+
+Create a function which given a list of tuples can pulls the corresonding verses out of Bible and combines them into a long string.
+
+```{python}
+def fullpassage(passage_str, bible_df):
+    verses_list = parse(passage_str)
+    if not verses_list:
+        return np.nan  #regex fail
+
+    verses_list = [(book, chapter, verse) for (book, chapter, verse) in verses_list]
+
+    texts = []
+    for book, chapter, verse in verses_list:
+        mask = (
+            (bible_df["book"] == book) &
+            (bible_df["chapter"] == chapter) &
+            (bible_df["verse"] == verse)
+        )
+        text_rows = bible_df.loc[mask, "text"]
+        if not text_rows.empty:
+            texts.append(text_rows.iloc[0])
+
+    return ' '.join(texts)
+```
+
+Create full Lectionary DataFrame by running the functions and dropping columns where the regex failed to find any passage.
+
+```{python}
+Lectionary["FullPassage"] = Lectionary["Passage"].apply(lambda x: fullpassage(x, Bible))
+Lectionary = Lectionary.dropna(subset=["FullPassage"])
+```
+
+Add liturgical season to Lectionary based on the contents of the Date column.
+
+```{python}
+#| results: 'markdown'
+def getseason(date_str):
+    s = date_str.lower()
+    if "advent" in s:
+        return "Advent"
+    elif any(x in s for x in ["christmas", "nativity", "holy family", "epiphany"]):
+        return "Christmas"
+    elif "lent" in s:
+        return "Lent"
+    elif any(x in s for x in ["palm sunday", "holy thursday", "good friday", "holy saturday"]):
+        return "Holy Week"
+    elif "easter" in s or "ascension" in s or "pentecost" in s:
+        return "Easter"
+    elif "ordinary" in s or "Ord.":
+        return "Ordinary Time"
+    else:
+        return "Feast Day"
+
+Lectionary["Season"] = Lectionary["Date"].apply(getseason)
+Lectionary.to_markdown()
+```
+
+## Adding sentiment
+
+```{python}
+#| results: 'markdown'
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+sid = SentimentIntensityAnalyzer()
+
+sentiments = Lectionary["FullPassage"].apply(lambda x: sid.polarity_scores(x))
+
+Lectionary["NegativeSentiment"] = sentiments.apply(lambda d: d['neg'])
+Lectionary["NeutralSentiment"] = sentiments.apply(lambda d: d['neu'])
+Lectionary["PositiveSentiment"] = sentiments.apply(lambda d: d['pos'])
+Lectionary["CompoundSentiment"] = sentiments.apply(lambda d: d['compound'])
+
+Lectionary.to_markdown() #yay
+```
+
+## Visualizations
+
+Comparing sentiment across reading types (all years)
+
+```{python}
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+sns.set(style="whitegrid", context="talk")
+
+palette = {
+    "Reading1": "#c8a4d3ff", #match to powerpoint
+    "Reading2": "#17726D",
+    "Gospel":   "#b2b08f"
+}
+
+plt.figure(figsize=(10, 6))
+
+sns.boxplot(
+    data=Lectionary,
+    x="Reading",
+    y="CompoundSentiment",
+    palette=palette,
+    order=["Reading1", "Reading2", "Gospel"]
+)
+
+plt.title("Compound Sentiment by Reading Type", fontsize=20)
+plt.xlabel("Reading Type")
+plt.ylim(-1, 1)
+plt.show()
+```
+
+Liturgical Year Line Chart (comparing years)
+
+```{python}
+Lectionary["Date"] = pd.Categorical(
+    Lectionary["Date"],
+    categories=Lectionary["Date"].unique(),
+    ordered=True
+)
+
+year_colors = {
+    "A": "#000000ff",
+    "B": "#efefefff",
+    "C": "#17726d"
+}
+
+season_colors = {
+    "Advent": "#80008020",
+    "Christmas": "#FFD70020",
+    "Ordinary Time": "#00800020",
+    "Lent": "#80008021",
+    "Holy Week": "#d6000020",
+    "Easter": "#FFD70021",
+    "Other": "#CCCCCC20"
+}
+
+sns.set(style="whitegrid", context="talk")
+plt.figure(figsize=(18, 6))
+
+sns.lineplot(
+    data=Lectionary,
+    x="Date",
+    y="CompoundSentiment",
+    hue="Year",
+    palette=year_colors,
+    linewidth=3,
+    errorbar=None
+)
+
+ax = plt.gca()
+
+x_positions = np.arange(len(Lectionary["Date"].cat.categories))
+Lectionary["xpos"] = Lectionary["Date"].cat.codes
+
+for season, group in Lectionary.groupby("Season"):
+    start = group["xpos"].min()
+    end   = group["xpos"].max()
+    ax.axvspan(start, end, color=season_colors[season], zorder=0)
+
+plt.title("Compound Sentiment Across Liturgical Year (with Seasonal Backgrounds)", fontsize=22)
+
+plt.xticks([], [])   #no date label
+plt.legend(title="Liturgical Year", fontsize=12)
+
+plt.tight_layout()
+plt.show()
+```
+
+Liturgical Year Line Chart (comparing years, looking only at Gospel)
+
+```{python}
+Lectionary["Date"] = pd.Categorical(
+    Lectionary["Date"],
+    categories=Lectionary["Date"].unique(),
+    ordered=True
+)
+
+year_colors = {
+    "A": "#000000ff",
+    "B": "#efefefff",
+    "C": "#17726d"
+}
+
+season_colors = {
+    "Advent": "#80008020",
+    "Christmas": "#FFD70020",
+    "Ordinary Time": "#00800020",
+    "Lent": "#80008021",
+    "Holy Week": "#d6000020",
+    "Easter": "#FFD70021",
+    "Other": "#CCCCCC20"
+}
+
+GospelLectionary = Lectionary[Lectionary["Reading"] == "Gospel"]
+
+sns.set(style="whitegrid", context="talk")
+plt.figure(figsize=(18, 6))
+
+sns.lineplot(
+    data=GospelLectionary,
+    x="Date",
+    y="CompoundSentiment",
+    hue="Year",
+    palette=year_colors,
+    linewidth=3,
+    errorbar=None
+)
+
+ax = plt.gca()
+
+x_positions = np.arange(len(Lectionary["Date"].cat.categories))
+Lectionary["xpos"] = Lectionary["Date"].cat.codes
+
+for season, group in Lectionary.groupby("Season"):
+    start = group["xpos"].min()
+    end   = group["xpos"].max()
+    ax.axvspan(start, end, color=season_colors[season], zorder=0)
+
+plt.title("Gospel Compound Sentiment Across Liturgical Year (with Seasonal Backgrounds)", fontsize=22)
+
+plt.xticks([], [])   #no date label
+plt.legend(title="Liturgical Year", fontsize=12)
+
+plt.tight_layout()
+plt.show()
+```
+
+Heatmap (looking for any connection between years/reading types)
+
+```{python}
+heatmap_data = Lectionary.pivot_table(
+    index="Reading",
+    columns="Year",
+    values="CompoundSentiment",
+    aggfunc="mean"
+)
+
+plt.figure(figsize=(6, 4))
+sns.heatmap(
+    heatmap_data,
+    annot=True,
+    fmt=".2f",
+    cmap="PiYG",
+    center=0
+)
+plt.title("Average Compound Sentiment by Reading and Year", fontsize=16)
+plt.xlabel("Year")
+plt.ylabel("Reading")
+plt.tight_layout()
+plt.show()
+```
