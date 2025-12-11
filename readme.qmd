@@ -11,7 +11,7 @@ jupyter: python3
 
 ## Project Overview
 
-The intention of this project is to collect all readings from a Catholic Sunday Mass to see if it is possible to identify any connections between their sentiment over time. In order to do this, we need to find the schedule of all readings, which I found at https://catholic-resources.org/Lectionary/Index-Sundays.htm. This resource did not include the Bible passages themselves, only the Bible citation, so I need to have a list of all Bible verses to pull from that could be correctly matched to the correct date. 
+The intention of this project is to collect all readings from a Catholic Sunday Mass to see if it is possible to identify any connections between their sentiment over time. In order to do this, we need to find the schedule of all readings, which I found at https://catholic-resources.org/Lectionary/Index-Sundays.htm. This resource did not include the Bible passages themselves, only the Bible citation, so I need to have a list of all Bible verses to pull from that could be correctly matched to the correct date.  
 
 I found it easiest to scrape the entire Bible from https://www.biblegateway.com/passage/, with help from https://www.usccb.org/offices/new-american-bible/books-bible, which gave me an accurate list of all books considered canon by the Catholic Church. By using regex to match the format of the notation used for the Bible citations to the corresponding columns of my scraped Bible dataframe, I was able to obtain the full passages read out loud for Reading 1, Reading 2, and the Gospel on Sundays (and Holy Days). 
 
