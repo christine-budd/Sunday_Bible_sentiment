@@ -1,0 +1,977 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "---\n",
+        "title: \"Unstructured Final Project: Scraping the Bible and Anlyzing Emotional Tones of Sunday Mass Readings\"\n",
+        "author: Christine Budd\n",
+        "format: gfm\n",
+        "execute: \n",
+        "  warning: false\n",
+        "  message: false\n",
+        "  errors: false\n",
+        "jupyter: python3\n",
+        "---\n",
+        "\n",
+        "## Project Overview\n",
+        "\n",
+        "The intention of this project is to collect all readings from a Catholic Sunday Mass to see if it is possible to identify any connections between their sentiment over time. In order to do this, we need to find the schedule of all readings, which I found at https://catholic-resources.org/Lectionary/Index-Sundays.htm. This resource did not include the Bible passages themselves, only the Bible citation, so I need to have a list of all Bible verses to pull from that could be correctly matched to the correct date.  \n",
+        "\n",
+        "I found it easiest to scrape the entire Bible from https://www.biblegateway.com/passage/, with help from https://www.usccb.org/offices/new-american-bible/books-bible, which gave me an accurate list of all books considered canon by the Catholic Church. By using regex to match the format of the notation used for the Bible citations to the corresponding columns of my scraped Bible dataframe, I was able to obtain the full passages read out loud for Reading 1, Reading 2, and the Gospel on Sundays (and Holy Days). \n",
+        "\n",
+        "I concluded this project by preforming some sentiment analysis on the full passage, getting a score for the negative, neutral, positive, and compound sentiment. I founda few interesting trends to notice in the sentiment analysis, but overall I did not find any significant patterns. FOr example, I did observe high positive sentiment during the Christmas and Easter period regardless of year (although granted, all years use the same readings during Christmas so this is only actually insightful for Easter), and the range of compound sentiment for Reading 1 drops a lot lower than it does for Reading 2 or the Gospel, even though the average sentiment remained high.\n",
+        "\n",
+        "## Obtaining table of all Bible verses\n",
+        "\n",
+        "First we make a dictionary of all the books of Bible, and number of verses in each book:"
+      ],
+      "id": "c750068c"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "import requests\n",
+        "import pandas as pd\n",
+        "import re\n",
+        "from bs4 import BeautifulSoup\n",
+        "\n",
+        "url = \"https://www.usccb.org/offices/new-american-bible/books-bible\"\n",
+        "\n",
+        "bookresponse = requests.get(url)\n",
+        "booksoup = BeautifulSoup(bookresponse.text, \"html.parser\")\n",
+        "\n",
+        "books = []\n",
+        "for i in booksoup.select(\"span.bookname\"):\n",
+        "    name_tag = i.find(\"strong\")\n",
+        "    if not name_tag:\n",
+        "        continue\n",
+        "    bookname = name_tag.get_text(strip=True)\n",
+        "\n",
+        "    chaptercount = 0\n",
+        "    for j in i.next_siblings:\n",
+        "        if j.name == \"span\" and \"bookname\" in j.get(\"class\", []):\n",
+        "            break\n",
+        "        if getattr(j, \"name\", None) == \"a\":\n",
+        "            style  = j.get(\"style\", \"\")\n",
+        "            if \"display:inline-block\" in style:\n",
+        "                chaptercount += 1\n",
+        "    books.append((bookname, chaptercount))\n",
+        "\n",
+        "books = [(bookname, chaptercount) for bookname, chaptercount in books if chaptercount > 0]\n",
+        "\n",
+        "bookdict = dict(books)\n",
+        "bookdict"
+      ],
+      "id": "921ee138",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Create function that given a book of the Bible, can scrape the entire chapter."
+      ],
+      "id": "4fc97adf"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "def NABREscrape(book):\n",
+        "    rows = []\n",
+        "    \n",
+        "    chapters = bookdict[book]\n",
+        "    for i in range(chapters):\n",
+        "        bookname = book\n",
+        "        chapter = i+1\n",
+        "\n",
+        "        url = f\"https://www.biblegateway.com/passage/?search={bookname}%20{chapter}&version=NABRE\"\n",
+        "\n",
+        "        chapterrequest = requests.get(url)\n",
+        "        chaptersoup = BeautifulSoup(chapterrequest.content, \"html.parser\")\n",
+        "        chaptertext = chaptersoup.find(\"div\", class_=\"version-NABRE\")\n",
+        "\n",
+        "        for j in chaptertext.find_all([\"h2\", \"h3\"], class_=[\"outline\", \"chapter\"]):\n",
+        "            j.decompose()\n",
+        "\n",
+        "        chaptertext = chaptertext.get_text(separator=\" \", strip=True)\n",
+        "        chapterentry = f\"{book} {i + 1}\"\n",
+        "\n",
+        "        rows.append({\"Chapter\": chapterentry, \"Text\": chaptertext})\n",
+        "\n",
+        "    df = pd.DataFrame(rows)\n",
+        "\n",
+        "    return df"
+      ],
+      "id": "a0f64cb2",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "We run the function for all books, and combine into a single dataframe."
+      ],
+      "id": "51234641"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "#| eval: false\n",
+        "allrowsdf = []\n",
+        "\n",
+        "for i in bookdict.keys():\n",
+        "    df = NABREscrape(i)\n",
+        "    allrowsdf.append(df)\n",
+        "\n",
+        "allbooks = pd.concat(allrowsdf, ignore_index=True)"
+      ],
+      "id": "86ca2663",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "We clean the dataframe, starting by removing anything that is not a bible verse."
+      ],
+      "id": "f33ce0da"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "#| eval: false\n",
+        "def verseextract(text):\n",
+        "    if \"RCU17TS\" in text:\n",
+        "        text = text.split(\"RCU17TS\")[-1]\n",
+        "\n",
+        "    first_verse_pos = text.find(\"1 \")\n",
+        "    if first_verse_pos != -1:\n",
+        "        text = text[first_verse_pos:]\n",
+        "\n",
+        "    text = re.sub(r'Footnotes.*', '', text, flags=re.IGNORECASE)\n",
+        "\n",
+        "    text = re.sub(r'\\(.*?\\)', '', text) #nongreedy parenthesis\n",
+        "\n",
+        "    text = re.sub(r'\\[.*?\\]', '', text) #nongreedy brackets\n",
+        "\n",
+        "    text = re.sub(r'\\s+', ' ', text)\n",
+        "\n",
+        "    text = text.strip()\n",
+        "\n",
+        "    return text\n",
+        "\n",
+        "allbooks[\"Text\"] = allbooks[\"Text\"].apply(verseextract)\n",
+        "allbooks.to_markdown()"
+      ],
+      "id": "7de339f2",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Now we are separating each chapter so that verses are on unique rows. This will be a new dataframe, called Bible"
+      ],
+      "id": "6f2d494c"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "#| eval: false\n",
+        "def split_verses(row):\n",
+        "    tokens = row['Chapter'].split()\n",
+        "    chapter = tokens[-1]\n",
+        "    book = ' '.join(tokens[:-1])\n",
+        "\n",
+        "    pattern = r'(\\d+)\\s(.*?)(?=\\s\\d+\\s|$)' #number upto next number, nongreedy)\n",
+        "    matches = re.findall(pattern, row['Text'])\n",
+        "\n",
+        "    verselist = []\n",
+        "    for i, j in matches:\n",
+        "        verselist.append({\n",
+        "            \"book\": book,\n",
+        "            \"chapter\": chapter,\n",
+        "            \"verse\": int(i),\n",
+        "            \"text\": j.strip()\n",
+        "        })\n",
+        "    return verselist\n",
+        "\n",
+        "\n",
+        "allverses = []\n",
+        "for _, row in allbooks.iterrows():\n",
+        "    allverses.extend(split_verses(row))\n",
+        "\n",
+        "Bible = pd.DataFrame(allverses)\n",
+        "\n",
+        "Bible[\"book\"] = Bible[\"book\"].str.strip().str.lower()\n",
+        "Bible[\"chapter\"] = Bible[\"chapter\"].astype(int)\n",
+        "Bible[\"verse\"] = Bible[\"verse\"].astype(int)\n",
+        "\n",
+        "Bible.head().to_markdown()"
+      ],
+      "id": "bd3c02c1",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "Bible = pd.read_csv(\"Bible.csv\")\n",
+        "Bible.head(10).to_markdown()"
+      ],
+      "id": "9226877b",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Obtaining reading schedule for each year\n",
+        "\n",
+        "We scrape html to get lectionary information. The first table is established in the html but the second and third are stuck together, so we manually separate them. Then, we convert all three tables to dataframes."
+      ],
+      "id": "0824fbf4"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "url = \"https://catholic-resources.org/Lectionary/Index-Sundays.htm\"\n",
+        "\n",
+        "headers = {\n",
+        "    \"User-Agent\": (\n",
+        "        \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) \"\n",
+        "        \"AppleWebKit/537.36 (KHTML, like Gecko) \"\n",
+        "        \"Chrome/120.0 Safari/537/36\"\n",
+        "    ),\n",
+        "    \"Accept-Language\": \"en-US,en;q=0.9\",\n",
+        "    \"Acccept\": \"text/html,application/xhtml+xml\",\n",
+        "    \"Referer\": \"https://www.google.com/\"\n",
+        "}\n",
+        "\n",
+        "lectresponse = requests.get(url, headers= headers)\n",
+        "lectsoup = BeautifulSoup(lectresponse.text, \"html.parser\")\n",
+        "\n",
+        "lecttables = lectsoup.find_all(\"table\")\n",
+        "\n",
+        "table1 = lecttables[0]\n",
+        "table2 = lecttables[1]\n",
+        "\n",
+        "rows = table2.find_all(\"tr\")\n",
+        "\n",
+        "split_index=None\n",
+        "for i, row in enumerate(rows):\n",
+        "    text = row.get_text(strip=True)\n",
+        "    if \"new testament reading\" in text.lower():\n",
+        "        split_index = i\n",
+        "        break\n",
+        "\n",
+        "table2soup = BeautifulSoup(\"<table></table><table></table>\", \"html.parser\")\n",
+        "table2tables = table2soup.find_all(\"table\")\n",
+        "\n",
+        "table2 = table2tables[0]\n",
+        "table3 = table2tables[1]\n",
+        "\n",
+        "for i in rows[:split_index]:\n",
+        "    table2.append(i)\n",
+        "\n",
+        "for i in rows[split_index:]:\n",
+        "    table3.append(i)\n",
+        "\n",
+        "def dfmaker(table):\n",
+        "    rows = []\n",
+        "    for i in table.find_all(\"tr\"):\n",
+        "        cells = i.find_all(\"td\")\n",
+        "        row = [c.get_text(strip=True) for c in cells]\n",
+        "        if row:\n",
+        "            rows.append(row)\n",
+        "\n",
+        "    df = pd.DataFrame(rows)\n",
+        "\n",
+        "    df.columns = df.iloc[0]\n",
+        "    df = df[1:].reset_index(drop=True)\n",
+        "\n",
+        "    df[\"Lect\"] = df[\"Lect # - Year\"].str.extract(r\"(\\d+)\").astype(int)\n",
+        "    df[\"Year\"] = df[\"Lect # - Year\"].str.extract(r\"\\d+-(.*)\")\n",
+        "\n",
+        "    return df\n",
+        "\n",
+        "Reading1 = dfmaker(table1)\n",
+        "Reading2 = dfmaker(table3)\n",
+        "Gospel = dfmaker(table2)"
+      ],
+      "id": "17d4d906",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Cleaning Reading1"
+      ],
+      "id": "8255b745"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "Reading1[\"Date\"] = Reading1[\"Sunday, Solemnity, or Feast\"]\n",
+        "Reading1[\"Passage\"] = Reading1[\"Old Testament Reading\"]\n",
+        "Reading1 = Reading1[[\"Date\", \"Lect\", \"Year\", \"Passage\"]]\n",
+        "Reading1 = Reading1.drop_duplicates(subset=[\"Lect\"], keep=\"first\")\n",
+        "Reading1 = Reading1.dropna(subset=[\"Year\"])\n",
+        "\n",
+        "def splitabc(df):\n",
+        "    abcrows = df[df[\"Year\"] == \"ABC\"]\n",
+        "    newdf = df[df[\"Year\"] != \"ABC\"]\n",
+        "\n",
+        "    rows = []\n",
+        "    for i in [\"A\",\"B\",\"C\"]:\n",
+        "        temp = abcrows.copy()\n",
+        "        temp[\"Year\"] = i\n",
+        "        rows.append(temp)\n",
+        "\n",
+        "    result = pd.concat([newdf] + rows, ignore_index=True)\n",
+        "\n",
+        "    return result\n",
+        "\n",
+        "Reading1 = splitabc(Reading1)\n",
+        "Reading1[\"Reading\"] = \"Reading1\"\n",
+        "Reading1 = Reading1.sort_values([\"Lect\", \"Year\"]).reset_index(drop=True)\n",
+        "Reading1.to_markdown()"
+      ],
+      "id": "1a2fee9f",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Cleaning Reading2"
+      ],
+      "id": "e9a91273"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "import numpy as np\n",
+        "\n",
+        "Reading2[\"Date\"] = Reading2[\"Sunday or Feast\"]\n",
+        "Reading2[\"Passage\"] = Reading2[\"New Testament Reading\"]\n",
+        "Reading2 = Reading2[[\"Date\", \"Lect\", \"Year\", \"Passage\"]]\n",
+        "Reading2 = Reading2.drop_duplicates(subset=[\"Lect\"], keep=\"first\")\n",
+        "Reading2 = Reading2.dropna(subset=[\"Year\"])\n",
+        "\n",
+        "Reading2 = splitabc(Reading2)\n",
+        "mask = Reading2[\"Date\"].str.contains(\"Easter\") & Reading2[\"Passage\"].str.contains(\"Acts\")\n",
+        "Reading2[\"Reading\"] = np.where(mask, \"Reading1\", \"Reading2\")\n",
+        "Reading2 = Reading2.sort_values([\"Lect\", \"Year\"]).reset_index(drop=True)\n",
+        "Reading2.to_markdown()"
+      ],
+      "id": "aa03ebed",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Cleaning Gospel"
+      ],
+      "id": "c1ea4cf0"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "Gospel[\"Date\"] = Gospel[\"Sunday or Feast\"]\n",
+        "Gospel[\"Passage\"] = Gospel[\"Gospel Reading\"]\n",
+        "Gospel = Gospel[[\"Date\", \"Lect\", \"Year\", \"Passage\"]]\n",
+        "Gospel = Gospel.drop_duplicates(subset=[\"Lect\"], keep=\"first\")\n",
+        "Gospel = Gospel.dropna(subset=[\"Year\"])\n",
+        "\n",
+        "Gospel = splitabc(Gospel)\n",
+        "Gospel[\"Reading\"] = \"Gospel\"\n",
+        "Gospel = Gospel.sort_values([\"Lect\", \"Year\"]).reset_index(drop=True)\n",
+        "Gospel.to_markdown()"
+      ],
+      "id": "5e86cc68",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "We combine the three smaller dataframes to create a complete working lectionary (with both readings and the Gospel)."
+      ],
+      "id": "17e0b3dc"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "Lectionary = pd.concat([Gospel, Reading1, Reading2], axis=0)\n",
+        "Lectionary.to_markdown()"
+      ],
+      "id": "dee41070",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Final Cleaning of Lectionary DataFrame"
+      ],
+      "id": "1358e266"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "#fixing missed joined readings in Year\n",
+        "rows = []\n",
+        "for idx, row in Lectionary.iterrows():\n",
+        "    stryear = str(row[\"Year\"])\n",
+        "    pairs = re.findall(r'(\\d+)-([ABC])', stryear)\n",
+        "\n",
+        "    if pairs:\n",
+        "        lect1, year1 = pairs[0]\n",
+        "        Lectionary.at[idx, \"Lect\"] = int(lect1)\n",
+        "        Lectionary.at[idx, \"Year\"] = year1\n",
+        "\n",
+        "        for lect, year in pairs[1:]: #new pairs\n",
+        "            row[\"Lect\"] = int(lect)\n",
+        "            row[\"Year\"] = year\n",
+        "            rows.append(row)\n",
+        "\n",
+        "Lectionary = pd.concat([Lectionary, pd.DataFrame(rows)], ignore_index=True)\n",
+        "\n",
+        "Lectionary[\"Date\"] = Lectionary[\"Date\"].str.replace(r\"\\(.*?\\)\", \"\", regex=True).str.strip()\n",
+        "\n",
+        "Lectionary[\"Passage\"] = (Lectionary[\"Passage\"].str.split(r'\\bor\\b').str[0].str.strip())\n",
+        "\n",
+        "Lectionary.head().to_markdown()"
+      ],
+      "id": "ba4f857d",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Merging the dataframes\n",
+        "\n",
+        "In the lectionary dataframe, the names of the books are abbreivated so we will need to create a dictionary to map them correctly to the Bible dataframe. Rather than map out every single book, we find which abbreviations were even used in Lectionary in the first place."
+      ],
+      "id": "45955cbe"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "abbrevs = (Lectionary[\"Passage\"].str.extract(r\"^\\s*([A-Za-z1-3]+\\s?[A-Za-z]+)\").dropna()[0].unique())\n",
+        "\n",
+        "abbrevs"
+      ],
+      "id": "9d60f11a",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "We create a dictionary for the abbreviations in the previous code (not all books of Bible, only those that appear in abbrevs)."
+      ],
+      "id": "f60b1e28"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "book_map = {\n",
+        "    \"Gen\": \"Genesis\",\"Exod\": \"Exodus\",\"Lev\": \"Leviticus\",\"Num\": \"Numbers\",\"Deut\": \"Deuteronomy\",\"Josh\": \"Joshua\",\"1 Sam\": \"1 Samuel\",\"2 Sam\": \"2 Samuel\",\"1 Kgs\": \"1 Kings\",\"2 Kgs\": \"2 Kings\",\"2 Chr\": \"2 Chronicles\",\"Neh\": \"Nehemiah\",\"Job\": \"Job\",\"Prov\": \"Proverbs\",\"Eccl\": \"Ecclesiastes\",\"Isa\": \"Isaiah\",\"Jer\": \"Jeremiah\",\"Ezek\": \"Ezekiel\",\"Dan\": \"Daniel\",\"Hos\": \"Hosea\",\"Amos\": \"Amos\",\"Jon\": \"Jonah\",\"Mic\": \"Micah\",\"Hab\": \"Habakkuk\",\"Zeph\": \"Zephaniah\",\"Zech\": \"Zechariah\",\"Mal\": \"Malachi\",\"Bar\": \"Baruch\",\"Sir\": \"Sirach\",\"Wis\": \"Wisdom\",\"2 Macc\": \"2 Maccabees\",\"Matt\": \"Matthew\",\"Mark\": \"Mark\",\"Luke\": \"Luke\",\"John\": \"John\",\"Acts\": \"Acts\",\"Rom\": \"Romans\",\"1 Cor\": \"1 Corinthians\",\"2 Cor\": \"2 Corinthians\",\"Gal\": \"Galatians\",\"Eph\": \"Ephesians\",\"Phil\": \"Philippians\",\"Col\": \"Colossians\",\"1 Thess\": \"1 Thessalonians\",\"2 Thess\": \"2 Thessalonians\",\"1 Tim\": \"1 Timothy\",\"2 Tim\": \"2 Timothy\",\"Titus\": \"Titus\",\"Phlm\": \"Philemon\",\"Heb\": \"Hebrews\",\"Jas\": \"James\",\"1 Pet\": \"1 Peter\",\"2 Pet\": \"2 Peter\",\"1 John\": \"1 John\",\"Rev\": \"Revelation\"\n",
+        "}"
+      ],
+      "id": "8a6113c9",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Make a function that given a Bible citation, creates a list of tuples, each tuple corresponding to a different verse."
+      ],
+      "id": "9c28b2c4"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "def parse(passage_str):\n",
+        "    try:\n",
+        "        result = []\n",
+        "\n",
+        "        match = re.match(r'^([1-3]?\\s?[A-Za-z]+)\\s+(.+)$', passage_str)\n",
+        "        if not match:\n",
+        "            return []\n",
+        "\n",
+        "        book_abbrev = match.group(1)\n",
+        "        book = book_map.get(book_abbrev, book_abbrev)\n",
+        "        refs = match.group(2)\n",
+        "\n",
+        "        refs = refs.replace('—', '--').replace('–', '--')\n",
+        "        parts = re.split(r'[;,]', refs)\n",
+        "        parts = [p.strip() for p in parts if p.strip()]\n",
+        "\n",
+        "        for part in parts:\n",
+        "            if \"--\" in part:#two chapters\n",
+        "                try:\n",
+        "                    startref, endref = part.split('--')\n",
+        "                    startchap, startverse = startref.split(':', 1)\n",
+        "                    endchap, endverse = endref.split(':', 1)\n",
+        "\n",
+        "                    startchap = int(re.sub(r'[^\\d]', '', startchap))\n",
+        "                    endchap = int(re.sub(r'[^\\d]', '', endchap))\n",
+        "                    startverse = int(re.sub(r'[^\\d]', '', startverse))\n",
+        "                    endverse = int(re.sub(r'[^\\d]', '', endverse))\n",
+        "\n",
+        "                    for chapter in range(startchap, endchap + 1):\n",
+        "                        if chapter == startchap and chapter == endchap:\n",
+        "                            verses = range(startverse, endverse + 1)\n",
+        "                        elif chapter == startchap:\n",
+        "                            verses = range(startverse, 67) #no psalms\n",
+        "                        elif chapter == endchap:\n",
+        "                            verses = range(1, endverse + 1)\n",
+        "                        else:\n",
+        "                            verses = range(1, 67)\n",
+        "                        for v in verses:\n",
+        "                            result.append((book, chap, v))\n",
+        "                except Exception:\n",
+        "                    return []\n",
+        "            else: #single chapters\n",
+        "                try:\n",
+        "                    matches = list(re.finditer(r'(\\d+)\\s*:', part))\n",
+        "                    if not matches:\n",
+        "                        return []\n",
+        "                    m = matches[-1]\n",
+        "                    chapter = int(m.group(1))\n",
+        "                    verses_str = part[m.end():].strip()\n",
+        "\n",
+        "                    verse_ranges = [v.strip() for v in verses_str.split(',')]\n",
+        "                    for vr in verse_ranges:\n",
+        "                        if \"-\" in vr:\n",
+        "                            startverse, endverse = vr.split('-', 1)\n",
+        "                            startverse = int(re.sub(r'[^\\d]', '', startverse))\n",
+        "                            endverse = int(re.sub(r'[^\\d]', '', endverse))\n",
+        "                        else:\n",
+        "                            startverse = int(re.sub(r'[^\\d]', '', vr))\n",
+        "                            endverse = startverse\n",
+        "                        for v in range(startverse, endverse + 1):\n",
+        "                            result.append((book, chapter, v))\n",
+        "                except Exception:\n",
+        "                    return []\n",
+        "\n",
+        "        return result\n",
+        "\n",
+        "    except Exception:\n",
+        "        return []"
+      ],
+      "id": "c5398664",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Create a function which given a list of tuples can pulls the corresonding verses out of Bible and combines them into a long string."
+      ],
+      "id": "7c51269c"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "def fullpassage(passage_str, bible_df):\n",
+        "    verses_list = parse(passage_str)\n",
+        "    if not verses_list:\n",
+        "        return np.nan  #regex fail\n",
+        "\n",
+        "    verses_list = [(book, chapter, verse) for (book, chapter, verse) in verses_list]\n",
+        "\n",
+        "    texts = []\n",
+        "    for book, chapter, verse in verses_list:\n",
+        "        mask = (\n",
+        "            (bible_df[\"book\"] == book) &\n",
+        "            (bible_df[\"chapter\"] == chapter) &\n",
+        "            (bible_df[\"verse\"] == verse)\n",
+        "        )\n",
+        "        text_rows = bible_df.loc[mask, \"text\"]\n",
+        "        if not text_rows.empty:\n",
+        "            texts.append(text_rows.iloc[0])\n",
+        "\n",
+        "    return ' '.join(texts)"
+      ],
+      "id": "052bf363",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Create full Lectionary DataFrame by running the functions and dropping columns where the regex failed to find any passage."
+      ],
+      "id": "187e7399"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "Lectionary[\"FullPassage\"] = Lectionary[\"Passage\"].apply(lambda x: fullpassage(x, Bible))\n",
+        "Lectionary = Lectionary.dropna(subset=[\"FullPassage\"])"
+      ],
+      "id": "25ddc95a",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Add liturgical season to Lectionary based on the contents of the Date column."
+      ],
+      "id": "184f55eb"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "def getseason(date_str):\n",
+        "    s = date_str.lower()\n",
+        "    if \"advent\" in s:\n",
+        "        return \"Advent\"\n",
+        "    elif any(x in s for x in [\"christmas\", \"nativity\", \"holy family\", \"epiphany\"]):\n",
+        "        return \"Christmas\"\n",
+        "    elif \"lent\" in s:\n",
+        "        return \"Lent\"\n",
+        "    elif any(x in s for x in [\"palm sunday\", \"holy thursday\", \"good friday\", \"holy saturday\"]):\n",
+        "        return \"Holy Week\"\n",
+        "    elif \"easter\" in s or \"ascension\" in s or \"pentecost\" in s:\n",
+        "        return \"Easter\"\n",
+        "    elif \"ordinary\" in s or \"Ord.\":\n",
+        "        return \"Ordinary Time\"\n",
+        "    else:\n",
+        "        return \"Feast Day\"\n",
+        "\n",
+        "Lectionary[\"Season\"] = Lectionary[\"Date\"].apply(getseason)\n",
+        "Lectionary.to_markdown()"
+      ],
+      "id": "429a26aa",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Adding sentiment"
+      ],
+      "id": "60534195"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {
+        "results": "markdown"
+      },
+      "source": [
+        "import nltk\n",
+        "from nltk.sentiment.vader import SentimentIntensityAnalyzer\n",
+        "\n",
+        "sid = SentimentIntensityAnalyzer()\n",
+        "\n",
+        "sentiments = Lectionary[\"FullPassage\"].apply(lambda x: sid.polarity_scores(x))\n",
+        "\n",
+        "Lectionary[\"NegativeSentiment\"] = sentiments.apply(lambda d: d['neg'])\n",
+        "Lectionary[\"NeutralSentiment\"] = sentiments.apply(lambda d: d['neu'])\n",
+        "Lectionary[\"PositiveSentiment\"] = sentiments.apply(lambda d: d['pos'])\n",
+        "Lectionary[\"CompoundSentiment\"] = sentiments.apply(lambda d: d['compound'])\n",
+        "\n",
+        "Lectionary.to_markdown() #yay"
+      ],
+      "id": "f642a96c",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "## Visualizations\n",
+        "\n",
+        "Comparing sentiment across reading types (all years)"
+      ],
+      "id": "043d3163"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "import seaborn as sns\n",
+        "import matplotlib.pyplot as plt\n",
+        "\n",
+        "sns.set(style=\"whitegrid\", context=\"talk\")\n",
+        "\n",
+        "palette = {\n",
+        "    \"Reading1\": \"#c8a4d3ff\", #match to powerpoint\n",
+        "    \"Reading2\": \"#17726D\",\n",
+        "    \"Gospel\":   \"#b2b08f\"\n",
+        "}\n",
+        "\n",
+        "plt.figure(figsize=(10, 6))\n",
+        "\n",
+        "sns.boxplot(\n",
+        "    data=Lectionary,\n",
+        "    x=\"Reading\",\n",
+        "    y=\"CompoundSentiment\",\n",
+        "    palette=palette,\n",
+        "    order=[\"Reading1\", \"Reading2\", \"Gospel\"]\n",
+        ")\n",
+        "\n",
+        "plt.title(\"Compound Sentiment by Reading Type\", fontsize=20)\n",
+        "plt.xlabel(\"Reading Type\")\n",
+        "plt.ylim(-1, 1)\n",
+        "plt.show()"
+      ],
+      "id": "08fb7fe9",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Liturgical Year Line Chart (comparing years)"
+      ],
+      "id": "a6425dc6"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "Lectionary[\"Date\"] = pd.Categorical(\n",
+        "    Lectionary[\"Date\"],\n",
+        "    categories=Lectionary[\"Date\"].unique(),\n",
+        "    ordered=True\n",
+        ")\n",
+        "\n",
+        "year_colors = {\n",
+        "    \"A\": \"#000000ff\",\n",
+        "    \"B\": \"#efefefff\",\n",
+        "    \"C\": \"#17726d\"\n",
+        "}\n",
+        "\n",
+        "season_colors = {\n",
+        "    \"Advent\": \"#80008020\",\n",
+        "    \"Christmas\": \"#FFD70020\",\n",
+        "    \"Ordinary Time\": \"#00800020\",\n",
+        "    \"Lent\": \"#80008021\",\n",
+        "    \"Holy Week\": \"#d6000020\",\n",
+        "    \"Easter\": \"#FFD70021\",\n",
+        "    \"Other\": \"#CCCCCC20\"\n",
+        "}\n",
+        "\n",
+        "sns.set(style=\"whitegrid\", context=\"talk\")\n",
+        "plt.figure(figsize=(18, 6))\n",
+        "\n",
+        "sns.lineplot(\n",
+        "    data=Lectionary,\n",
+        "    x=\"Date\",\n",
+        "    y=\"CompoundSentiment\",\n",
+        "    hue=\"Year\",\n",
+        "    palette=year_colors,\n",
+        "    linewidth=3,\n",
+        "    errorbar=None\n",
+        ")\n",
+        "\n",
+        "ax = plt.gca()\n",
+        "\n",
+        "x_positions = np.arange(len(Lectionary[\"Date\"].cat.categories))\n",
+        "Lectionary[\"xpos\"] = Lectionary[\"Date\"].cat.codes\n",
+        "\n",
+        "for season, group in Lectionary.groupby(\"Season\"):\n",
+        "    start = group[\"xpos\"].min()\n",
+        "    end   = group[\"xpos\"].max()\n",
+        "    ax.axvspan(start, end, color=season_colors[season], zorder=0)\n",
+        "\n",
+        "plt.title(\"Compound Sentiment Across Liturgical Year (with Seasonal Backgrounds)\", fontsize=22)\n",
+        "\n",
+        "plt.xticks([], [])   #no date label\n",
+        "plt.legend(title=\"Liturgical Year\", fontsize=12)\n",
+        "\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "ff060677",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Liturgical Year Line Chart (comparing years, looking only at Gospel)"
+      ],
+      "id": "46f05167"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "Lectionary[\"Date\"] = pd.Categorical(\n",
+        "    Lectionary[\"Date\"],\n",
+        "    categories=Lectionary[\"Date\"].unique(),\n",
+        "    ordered=True\n",
+        ")\n",
+        "\n",
+        "year_colors = {\n",
+        "    \"A\": \"#000000ff\",\n",
+        "    \"B\": \"#efefefff\",\n",
+        "    \"C\": \"#17726d\"\n",
+        "}\n",
+        "\n",
+        "season_colors = {\n",
+        "    \"Advent\": \"#80008020\",\n",
+        "    \"Christmas\": \"#FFD70020\",\n",
+        "    \"Ordinary Time\": \"#00800020\",\n",
+        "    \"Lent\": \"#80008021\",\n",
+        "    \"Holy Week\": \"#d6000020\",\n",
+        "    \"Easter\": \"#FFD70021\",\n",
+        "    \"Other\": \"#CCCCCC20\"\n",
+        "}\n",
+        "\n",
+        "GospelLectionary = Lectionary[Lectionary[\"Reading\"] == \"Gospel\"]\n",
+        "\n",
+        "sns.set(style=\"whitegrid\", context=\"talk\")\n",
+        "plt.figure(figsize=(18, 6))\n",
+        "\n",
+        "sns.lineplot(\n",
+        "    data=GospelLectionary,\n",
+        "    x=\"Date\",\n",
+        "    y=\"CompoundSentiment\",\n",
+        "    hue=\"Year\",\n",
+        "    palette=year_colors,\n",
+        "    linewidth=3,\n",
+        "    errorbar=None\n",
+        ")\n",
+        "\n",
+        "ax = plt.gca()\n",
+        "\n",
+        "x_positions = np.arange(len(Lectionary[\"Date\"].cat.categories))\n",
+        "Lectionary[\"xpos\"] = Lectionary[\"Date\"].cat.codes\n",
+        "\n",
+        "for season, group in Lectionary.groupby(\"Season\"):\n",
+        "    start = group[\"xpos\"].min()\n",
+        "    end   = group[\"xpos\"].max()\n",
+        "    ax.axvspan(start, end, color=season_colors[season], zorder=0)\n",
+        "\n",
+        "plt.title(\"Gospel Compound Sentiment Across Liturgical Year (with Seasonal Backgrounds)\", fontsize=22)\n",
+        "\n",
+        "plt.xticks([], [])   #no date label\n",
+        "plt.legend(title=\"Liturgical Year\", fontsize=12)\n",
+        "\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "d7ff3de0",
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "Heatmap (looking for any connection between years/reading types)"
+      ],
+      "id": "1162cbca"
+    },
+    {
+      "cell_type": "code",
+      "metadata": {},
+      "source": [
+        "heatmap_data = Lectionary.pivot_table(\n",
+        "    index=\"Reading\",\n",
+        "    columns=\"Year\",\n",
+        "    values=\"CompoundSentiment\",\n",
+        "    aggfunc=\"mean\"\n",
+        ")\n",
+        "\n",
+        "plt.figure(figsize=(6, 4))\n",
+        "sns.heatmap(\n",
+        "    heatmap_data,\n",
+        "    annot=True,\n",
+        "    fmt=\".2f\",\n",
+        "    cmap=\"PiYG\",\n",
+        "    center=0\n",
+        ")\n",
+        "plt.title(\"Average Compound Sentiment by Reading and Year\", fontsize=16)\n",
+        "plt.xlabel(\"Year\")\n",
+        "plt.ylabel(\"Reading\")\n",
+        "plt.tight_layout()\n",
+        "plt.show()"
+      ],
+      "id": "03fbfdd1",
+      "execution_count": null,
+      "outputs": []
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "name": "python3",
+      "language": "python",
+      "display_name": "Python 3 (ipykernel)",
+      "path": "C:\\Users\\Christine\\AppData\\Roaming\\Python\\share\\jupyter\\kernels\\python3"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
